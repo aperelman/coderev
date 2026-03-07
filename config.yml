@@ -1,0 +1,4 @@
+github:
+  token: your_github_token_here
+  owner: your_repo_owner
+  repo: your_repo_name

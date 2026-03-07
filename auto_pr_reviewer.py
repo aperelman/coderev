@@ -1,16 +1,16 @@
 import requests
 import json
+import yaml
 
-# GitHub API token
-GITHUB_TOKEN = 'your_github_token_here'
-# GitHub repository details
-OWNER = 'your_repo_owner'
-REPO = 'your_repo_name'
+def load_config():
+    with open('config.yml', 'r') as file:
+        config = yaml.safe_load(file)
+    return config
 
-def get_pr_files(pr_number):
-    url = f'https://api.github.com/repos/{OWNER}/{REPO}/pulls/{pr_number}/files'
+def get_pr_files(pr_number, config):
+    url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/files'
     headers = {
-        'Authorization': f'token {GITHUB_TOKEN}',
+        'Authorization': f'token {config["github"]["token"]}',
         'Accept': 'application/vnd.github.v3+json'
     }
     response = requests.get(url, headers=headers)
@@ -31,10 +31,10 @@ def suggest_reviewers(pr_files):
         # Add more criteria as needed
     return reviewers
 
-def create_pr_review_request(pr_number, reviewers):
-    url = f'https://api.github.com/repos/{OWNER}/{REPO}/pulls/{pr_number}/reviews'
+def create_pr_review_request(pr_number, reviewers, config):
+    url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/reviews'
     headers = {
-        'Authorization': f'token {GITHUB_TOKEN}',
+        'Authorization': f'token {config["github"]["token"]}',
         'Accept': 'application/vnd.github.v3+json'
     }
     payload = {
@@ -47,11 +47,12 @@ def create_pr_review_request(pr_number, reviewers):
         print(f"Failed to create review request: {response.status_code}")
 
 def main(pr_number):
-    pr_files = get_pr_files(pr_number)
+    config = load_config()
+    pr_files = get_pr_files(pr_number, config)
     if pr_files:
         reviewers = suggest_reviewers(pr_files)
         if reviewers:
-            create_pr_review_request(pr_number, reviewers)
+            create_pr_review_request(pr_number, reviewers, config)
 
 if __name__ == '__main__':
     pr_number = input("Enter the PR number: ")
