@@ -67,7 +67,7 @@ def main(pr_number):
     config = load_config()
     pr_files = get_pr_files(pr_number, config)
     reviewers = suggest_reviewers(pr_files)
-    create_pr_review_request(pr_number, reviewers, config)
+    create_pr_review_request(pr_number, reviewers, config)  # Pass config here
     save_context(pr_number, reviewers)
 
 if __name__ == '__main__':
