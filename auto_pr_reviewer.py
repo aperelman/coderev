@@ -78,6 +78,6 @@ if __name__ == '__main__':
     context = load_context()
     if context and context['pr_number'] == pr_number:
         reviewers = context['reviewers']
-        create_pr_review_request(pr_number, reviewers, config)
+        create_pr_review_request(pr_number, reviewers, config)  # Pass config here
     else:
         main(pr_number)
