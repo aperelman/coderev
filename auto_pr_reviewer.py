@@ -3,11 +3,13 @@ import json
 import yaml
 
 def load_config():
+    # Load configuration from config.yml
     with open('config.yml', 'r') as file:
         config = yaml.safe_load(file)
     return config
 
 def get_pr_files(pr_number, config):
+    # Fetch files associated with a pull request
     url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/files'
     headers = {
         'Authorization': f'token {config["github"]["token"]}',
@@ -21,8 +23,8 @@ def get_pr_files(pr_number, config):
         return []
 
 def suggest_reviewers(pr_files):
+    # Suggest reviewers based on the files changed
     reviewers = []
-    # Example criteria: suggest reviewers for files with specific extensions
     for file in pr_files:
         if file['filename'].endswith('.py'):
             reviewers.append('python_reviewer')
@@ -32,6 +34,7 @@ def suggest_reviewers(pr_files):
     return reviewers
 
 def create_pr_review_request(pr_number, reviewers, config):
+    # Create a review request for the pull request
     url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/reviews'
     headers = {
         'Authorization': f'token {config["github"]["token"]}',
@@ -49,11 +52,11 @@ def create_pr_review_request(pr_number, reviewers, config):
 def main(pr_number):
     config = load_config()
     pr_files = get_pr_files(pr_number, config)
-    if pr_files:
-        reviewers = suggest_reviewers(pr_files)
-        if reviewers:
-            create_pr_review_request(pr_number, reviewers, config)
+    reviewers = suggest_reviewers(pr_files)
+    create_pr_review_request(pr_number, reviewers, config)
 
 if __name__ == '__main__':
-    pr_number = input("Enter the PR number: ")
-    main(pr_number)
+    if len(sys.argv) != 2:
+        print("Usage: python auto_pr_reviewer.py <pr_number>")
+        sys.exit(1)
+    main(int(sys.argv[1]))
