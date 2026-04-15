@@ -50,14 +50,34 @@ def create_pr_review_request(pr_number, reviewers, config):
     else:
         print(f"Failed to create review request: {response.status_code}")
 
+def save_context(pr_number, reviewers):
+    # Save context to context.json
+    with open('context.json', 'w') as file:
+        json.dump({'pr_number': pr_number, 'reviewers': reviewers}, file)
+
+def load_context():
+    # Load context from context.json
+    try:
+        with open('context.json', 'r') as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return None
+
 def main(pr_number):
     config = load_config()
     pr_files = get_pr_files(pr_number, config)
     reviewers = suggest_reviewers(pr_files)
     create_pr_review_request(pr_number, reviewers, config)
+    save_context(pr_number, reviewers)
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python auto_pr_reviewer.py <pr_number>")
         sys.exit(1)
-    main(int(sys.argv[1]))
+    pr_number = int(sys.argv[1])
+    context = load_context()
+    if context and context['pr_number'] == pr_number:
+        reviewers = context['reviewers']
+        create_pr_review_request(pr_number, reviewers, config)
+    else:
+        main(pr_number)
