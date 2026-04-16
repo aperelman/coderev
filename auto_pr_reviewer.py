@@ -10,16 +10,36 @@ def load_config():
             config = yaml.safe_load(file)
         return config
     except FileNotFoundError:
-        print("Configuration file not found. Please check config.yml.")
-        sys.exit(1)
+        print("Configuration file not found. Using default configuration.")
+        return {
+            "github": {
+                "token": "",
+                "owner": "",
+                "repo": ""
+            },
+            "gitlab": {
+                "token": "",
+                "project_id": ""
+            }
+        }
 
 def get_pr_files(pr_number, config):
     # Fetch files associated with a pull request
-    url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/files'
-    headers = {
-        'Authorization': f'token {config["github"]["token"]}',
-        'Accept': 'application/vnd.github.v3+json'
-    }
+    if 'github' in config and config['github']:
+        url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/files'
+        headers = {
+            'Authorization': f'token {config["github"]["token"]}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    elif 'gitlab' in config and config['gitlab']:
+        url = f'https://gitlab.com/api/v4/projects/{config["gitlab"]["project_id"]}/merge_requests/{pr_number}/changes'
+        headers = {
+            'Private-Token': config["gitlab"]["token"]
+        }
+    else:
+        print("No valid configuration found.")
+        return []
+
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -41,11 +61,21 @@ def suggest_reviewers(pr_files):
 
 def create_pr_review_request(pr_number, reviewers, config):
     # Create a review request for the pull request
-    url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/reviews'
-    headers = {
-        'Authorization': f'token {config["github"]["token"]}',
-        'Accept': 'application/vnd.github.v3+json'
-    }
+    if 'github' in config and config['github']:
+        url = f'https://api.github.com/repos/{config["github"]["owner"]}/{config["github"]["repo"]}/pulls/{pr_number}/reviews'
+        headers = {
+            'Authorization': f'token {config["github"]["token"]}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    elif 'gitlab' in config and config['gitlab']:
+        url = f'https://gitlab.com/api/v4/projects/{config["gitlab"]["project_id"]}/merge_requests/{pr_number}/reviews'
+        headers = {
+            'Private-Token': config["gitlab"]["token"]
+        }
+    else:
+        print("No valid configuration found.")
+        return
+
     payload = {
         'reviewers': reviewers
     }
