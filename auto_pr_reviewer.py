@@ -65,8 +65,20 @@ def load_context():
 
 def main(pr_number):
     config = load_config()
+    if not config:
+        print("Failed to load configuration. Please check config.yml.")
+        sys.exit(1)
+
     pr_files = get_pr_files(pr_number, config)
+    if not pr_files:
+        print(f"No files found for PR {pr_number}.")
+        sys.exit(0)
+
     reviewers = suggest_reviewers(pr_files)
+    if not reviewers:
+        print("No suitable reviewers found.")
+        sys.exit(0)
+
     create_pr_review_request(pr_number, reviewers, config)  # Pass config here
     save_context(pr_number, reviewers)
 
