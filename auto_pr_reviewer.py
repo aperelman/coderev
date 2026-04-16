@@ -5,9 +5,13 @@ import sys
 
 def load_config():
     # Load configuration from config.yml
-    with open('config.yml', 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+    try:
+        with open('config.yml', 'r') as file:
+            config = yaml.safe_load(file)
+        return config
+    except FileNotFoundError:
+        print("Configuration file not found. Please check config.yml.")
+        sys.exit(1)
 
 def get_pr_files(pr_number, config):
     # Fetch files associated with a pull request
@@ -16,11 +20,12 @@ def get_pr_files(pr_number, config):
         'Authorization': f'token {config["github"]["token"]}',
         'Accept': 'application/vnd.github.v3+json'
     }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
         return response.json()
-    else:
-        print(f"Failed to fetch PR files: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch PR files: {e}")
         return []
 
 def suggest_reviewers(pr_files):
@@ -44,11 +49,12 @@ def create_pr_review_request(pr_number, reviewers, config):
     payload = {
         'reviewers': reviewers
     }
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
-    if response.status_code == 201:
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
         print(f"Review request created for PR {pr_number}")
-    else:
-        print(f"Failed to create review request: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to create review request: {e}")
 
 def save_context(pr_number, reviewers):
     # Save context to context.json
