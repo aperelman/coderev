@@ -4,4 +4,4 @@ github:
   repo: your_repo_name
 gitlab:
   token: your_gitlab_token_here
-  project_id: your_project_id
+  project_id: "12345678"  # Replace with the actual project ID for https://gitlab.com/rad_tool/nha
