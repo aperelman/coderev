@@ -1,7 +1,4 @@
-github:
-  token: your_github_token_here
-  owner: your_repo_owner
-  repo: your_repo_name
 gitlab:
-  token: your_gitlab_token_here
-  project_id: "12345678"  # Replace with the actual project ID for https://gitlab.com/rad_tool/nha
+  token: "glpat-4oWetD_LXi7qSVv09ZNEs2M6MQpvOjEKdTptYndzMA8.01.170dcvyw4"
+  project_id: "61399606"
+  reviewer_username: sergioram
