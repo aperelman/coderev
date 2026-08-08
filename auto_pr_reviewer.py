@@ -1,584 +1,550 @@
 #!/usr/bin/env python3
-import re
-import sys
+import subprocess
 import json
+import os
 import yaml
-import argparse
+import sys
+import re
 import requests
-from urllib.parse import quote
+import time
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5-coder:7b"
-MAX_DIFF_CHARS = 6000
-MAX_FILE_CHARS = 6000
+def load_config():
+    with open('config.yml', 'r') as f:
+        return yaml.safe_load(f)
 
-SERGIO_PROMPT = """You are Sergio Ramos — a tough, uncompromising code reviewer.
-You do not tolerate sloppy code, poor naming, missing error handling, or unnecessary complexity.
-Be direct and brutal, but accurate. No sugarcoating.
-
-You MUST respond with valid JSON only — no preamble, no markdown fences, no extra text.
-
-JSON schema:
-{
-  "summary": "Overall assessment in 2-4 sentences. End with verdict: APPROVE | APPROVE WITH COMMENTS | REJECT",
-  "verdict": "APPROVE" | "APPROVE WITH COMMENTS" | "REJECT",
-  "inline_comments": [
-    {
-      "file": "path/to/file.py",
-      "line": <integer, new-side line number from the [N] prefix in the diff>,
-      "comment": "Your specific comment about this line."
-    }
-  ]
-}
-
-Rules:
-- You are given BOTH the full current file content AND the diff for each changed file.
-- Use the full file content to understand the complete context before judging the diff.
-- inline_comments must reference real files and real [N] line numbers from the diff section.
-- line numbers must be new-side (lines shown with [N] prefix, not [-] removed lines).
-- Do NOT comment on things that are already correctly handled in the full file.
-- Keep each inline comment focused and actionable.
-- If a file has no issues, omit it from inline_comments.
-- inline_comments may be [] if the code is clean.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Shared utilities
-# ---------------------------------------------------------------------------
-
-def load_config(path='config.yml'):
-    try:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        print(f"{path} not found.")
-        sys.exit(1)
-
-
-def _annotate_diff(diff_text):
-    lines = diff_text.splitlines()
-    result = []
-    new_line = 0
-    for line in lines:
-        if line.startswith('@@'):
-            m = re.search(r'\+(\d+)', line)
-            if m:
-                new_line = int(m.group(1)) - 1
-            result.append(line)
-        elif line.startswith('-'):
-            result.append(f"[-] {line}")
-        else:
-            new_line += 1
-            result.append(f"[{new_line}] {line}")
-    return "\n".join(result)
-
-
-def build_file_line_map(changes):
-    """Return {path: set_of_valid_new_side_line_numbers}."""
-    file_lines = {}
-    for change in changes:
-        path = change.get('new_path', change.get('old_path', 'unknown'))
-        valid_lines = set()
-        new_line = 0
-        for line in change.get('diff', '').splitlines():
-            if line.startswith('@@'):
-                m = re.search(r'\+(\d+)', line)
-                if m:
-                    new_line = int(m.group(1)) - 1
-            elif not line.startswith('-'):
-                new_line += 1
-                valid_lines.add(new_line)
-        file_lines[path] = valid_lines
-    return file_lines
-
-
-def ollama_review(prompt_context, title):
-    prompt = (f"{SERGIO_PROMPT}\n\n"
-              f"PR/MR Title: {title}\n\n"
-              f"{prompt_context}")
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }
-    try:
-        print("Sending diff to Ollama for review...")
-        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        r.raise_for_status()
-        raw = r.json().get("response", "").strip()
-        raw = re.sub(r'^```[a-z]*\n?', '', raw)
-        raw = re.sub(r'\n?```$', '', raw.strip())
-        return json.loads(raw)
-    except requests.exceptions.RequestException as e:
-        print(f"Ollama request failed: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse Sergio's JSON: {e}")
-        return None
-
-
-def save_context(data):
-    with open('context.json', 'w') as f:
-        json.dump(data, f)
-
-
-# ---------------------------------------------------------------------------
-# GitLab
-# ---------------------------------------------------------------------------
-
-def gl_headers(config):
-    return {'Private-Token': config["gitlab"]["token"].strip()}
-
-
-def gl_get_open_mrs(config):
-    pid = config["gitlab"]["project_id"]
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests'
-    try:
-        r = requests.get(url, headers=gl_headers(config), params={'state': 'opened'})
-        r.raise_for_status()
-        mrs = r.json()
-        return [m for m in mrs
-                if not m['title'].startswith('Draft:')
-                and not m['title'].startswith('[WIP]')]
-    except requests.exceptions.RequestException as e:
-        print(f"GitLab: failed to fetch MRs: {e}")
-        return []
-
-
-def gl_get_mr_details(mr_iid, config):
-    pid = config["gitlab"]["project_id"]
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests/{mr_iid}'
-    try:
-        r = requests.get(url, headers=gl_headers(config))
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        print(f"GitLab: failed to fetch MR details: {e}")
-        return None
-
-
-def gl_get_mr_changes(mr_iid, config):
-    pid = config["gitlab"]["project_id"]
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests/{mr_iid}/changes'
-    try:
-        r = requests.get(url, headers=gl_headers(config))
-        r.raise_for_status()
-        return r.json().get('changes', [])
-    except requests.exceptions.RequestException as e:
-        print(f"GitLab: failed to fetch MR changes: {e}")
-        return []
-
-
-def gl_get_file_content(file_path, branch, config):
-    pid = config["gitlab"]["project_id"]
-    encoded_path = quote(file_path, safe='')
-    url = f'https://gitlab.com/api/v4/projects/{pid}/repository/files/{encoded_path}/raw'
-    try:
-        r = requests.get(url, headers=gl_headers(config), params={'ref': branch})
-        r.raise_for_status()
-        return r.text
-    except requests.exceptions.RequestException as e:
-        print(f"  GitLab: could not fetch {file_path}: {e}")
-        return None
-
-
-def gl_assign_reviewer(mr_iid, config):
-    reviewer_username = config["gitlab"].get("reviewer_username", "sergioram")
-    pid = config["gitlab"]["project_id"]
-    r = requests.get('https://gitlab.com/api/v4/users',
-                     headers=gl_headers(config),
-                     params={'username': reviewer_username})
-    r.raise_for_status()
-    users = r.json()
-    if not users:
-        print(f"GitLab: reviewer {reviewer_username} not found.")
-        return
-    reviewer_id = users[0]['id']
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests/{mr_iid}'
-    r = requests.put(url, headers=gl_headers(config), json={'reviewer_ids': [reviewer_id]})
-    r.raise_for_status()
-    print(f"GitLab: assigned {reviewer_username} as reviewer on MR !{mr_iid}")
-
-
-def gl_post_note(mr_iid, body, config):
-    pid = config["gitlab"]["project_id"]
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests/{mr_iid}/notes'
-    r = requests.post(url, headers=gl_headers(config), json={'body': body})
-    r.raise_for_status()
-    print(f"GitLab: summary note posted on MR !{mr_iid}")
-
-
-def gl_post_inline(mr_iid, diff_refs, file_path, new_line, body, config):
-    pid = config["gitlab"]["project_id"]
-    url = f'https://gitlab.com/api/v4/projects/{pid}/merge_requests/{mr_iid}/discussions'
-    payload = {
-        "body": body,
-        "position": {
-            "position_type": "text",
-            "base_sha":  diff_refs["base_sha"],
-            "head_sha":  diff_refs["head_sha"],
-            "start_sha": diff_refs["start_sha"],
-            "new_path":  file_path,
-            "old_path":  file_path,
-            "new_line":  new_line,
-        }
-    }
-    try:
-        r = requests.post(url, headers=gl_headers(config), json=payload)
-        r.raise_for_status()
-        print(f"  GitLab: inline comment posted: {file_path}:{new_line}")
+def setup_ssh_for_service(service, config):
+    """Setup SSH for a specific service"""
+    if service == 'github':
+        ssh_key = config.get('ssh_key') or os.path.expanduser("~/.ssh/id_ed25519_sergio_")
+    elif service == 'gitlab':
+        ssh_key = config.get('ssh_key') or os.path.expanduser("~/.ssh/id_ed25519_gl")
+    else:
+        return False
+    
+    if os.path.exists(ssh_key):
+        os.environ['GIT_SSH_COMMAND'] = f"ssh -i {ssh_key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+        print(f"🔑 Using {service} SSH key: {ssh_key}")
         return True
-    except requests.exceptions.RequestException as e:
-        print(f"  GitLab: inline comment failed ({file_path}:{new_line}): {e}")
+    else:
+        print(f"❌ SSH key not found for {service}: {ssh_key}")
         return False
 
+# ============================================
+# OLLAMA FUNCTIONS
+# ============================================
 
-def gl_build_prompt_context(changes, branch, config):
-    parts = []
-    total = 0
-    budget = MAX_DIFF_CHARS + MAX_FILE_CHARS
-    for change in changes:
-        path = change.get('new_path', change.get('old_path', 'unknown'))
-        annotated = _annotate_diff(change.get('diff', ''))
-        full_content = gl_get_file_content(path, branch, config)
-        if full_content and len(full_content) > MAX_FILE_CHARS:
-            full_content = full_content[:MAX_FILE_CHARS] + "\n... (truncated)"
-        chunk = f"### FILE: {path}\n"
-        if full_content:
-            chunk += f"#### Full current content:\n```\n{full_content}\n```\n\n"
-        chunk += f"#### Diff (line numbers in [N] prefix):\n{annotated}\n"
-        if total + len(chunk) > budget:
-            remaining = budget - total
-            if remaining > 200:
-                parts.append(chunk[:remaining] + "\n... (truncated)")
-            break
-        parts.append(chunk)
-        total += len(chunk)
-    return "\n".join(parts)
-
-
-def run_gitlab(config):
-    mrs = gl_get_open_mrs(config)
-    if not mrs:
-        print("GitLab: no open (non-draft) MRs found.")
-        return
-
-    mr = sorted(mrs, key=lambda x: x['updated_at'], reverse=True)[0]
-    mr_iid = mr['iid']
-    print(f"GitLab: MR !{mr_iid}: {mr['title']}")
-
-    mr_details = gl_get_mr_details(mr_iid, config)
-    diff_refs = mr_details.get('diff_refs') if mr_details else None
-    if not diff_refs:
-        print("GitLab: warning — no diff_refs, inline comments will be skipped.")
-    branch = mr_details.get('source_branch', 'main') if mr_details else 'main'
-
-    changes = gl_get_mr_changes(mr_iid, config)
-    if not changes:
-        print("GitLab: no changes found.")
-        return
-
-    print(f"GitLab: changed files: {[c['new_path'] for c in changes]}")
-    gl_assign_reviewer(mr_iid, config)
-
-    prompt_context = gl_build_prompt_context(changes, branch, config)
-    file_line_map = build_file_line_map(changes)
-    review = ollama_review(prompt_context, mr['title'])
-    reviewer = config["gitlab"].get("reviewer_username", "sergioram")
-
-    if not review:
-        gl_post_note(mr_iid,
-                     f"⚠️ **Sergio Ramos** (@{reviewer}): review failed (Ollama unavailable or bad JSON).",
-                     config)
-        save_context({'gitlab_mr_iid': mr_iid})
-        return
-
-    failed_inline = []
-    inline_comments = review.get("inline_comments", [])
-
-    if diff_refs and inline_comments:
-        print(f"GitLab: posting {len(inline_comments)} inline comment(s)...")
-        for ic in inline_comments:
-            file_path = ic.get("file", "")
-            line = ic.get("line")
-            comment = ic.get("comment", "")
-            if line not in file_line_map.get(file_path, set()):
-                print(f"  Invalid position skipped: {file_path}:{line}")
-                failed_inline.append(ic)
-                continue
-            body = f"**Sergio Ramos** (@{reviewer}):\n\n{comment}"
-            if not gl_post_inline(mr_iid, diff_refs, file_path, line, body, config):
-                failed_inline.append(ic)
-    else:
-        failed_inline = inline_comments
-
-    verdict_emoji = {"APPROVE": "✅", "APPROVE WITH COMMENTS": "⚠️", "REJECT": "❌"}.get(
-        review.get("verdict", ""), "🔍")
-    summary = (
-        f"## {verdict_emoji} Sergio Ramos (@{reviewer}) — Code Review\n\n"
-        f"{review.get('summary', '_No summary provided._')}\n"
-    )
-    if failed_inline:
-        summary += "\n---\n### Comments (could not be posted inline)\n\n"
-        for ic in failed_inline:
-            summary += f"**`{ic.get('file')}` line {ic.get('line')}:** {ic.get('comment')}\n\n"
-
-    gl_post_note(mr_iid, summary, config)
-    save_context({'gitlab_mr_iid': mr_iid})
-    print("GitLab: done.")
-
-
-# ---------------------------------------------------------------------------
-# GitHub
-# ---------------------------------------------------------------------------
-
-def gh_headers(config):
-    return {
-        'Authorization': f"token {config['github']['token'].strip()}",
-        'Accept': 'application/vnd.github.v3+json',
-    }
-
-
-def gh_get_open_prs(config):
-    repo = config["github"]["repo"]  # e.g. "aperelman/attn2graph"
-    url = f'https://api.github.com/repos/{repo}/pulls'
+def check_ollama_running():
+    """Check if Ollama is running"""
     try:
-        r = requests.get(url, headers=gh_headers(config), params={'state': 'open'})
-        r.raise_for_status()
-        return [p for p in r.json() if not p.get('draft', False)]
-    except requests.exceptions.RequestException as e:
-        print(f"GitHub: failed to fetch PRs: {e}")
-        return []
+        response = requests.get('http://127.0.0.1:11434/api/tags', timeout=2)
+        if response.status_code == 200:
+            return True
+    except:
+        pass
+    return False
 
-
-def gh_get_pr_files(pr_number, config):
-    repo = config["github"]["repo"]
-    url = f'https://api.github.com/repos/{repo}/pulls/{pr_number}/files'
+def start_ollama():
+    """Start Ollama if not running"""
+    print("🔄 Ollama not running. Attempting to start...")
+    
+    # Check if ollama is installed
     try:
-        r = requests.get(url, headers=gh_headers(config))
-        r.raise_for_status()
-        files = []
-        for f in r.json():
-            files.append({
-                'new_path': f['filename'],
-                'old_path': f.get('previous_filename', f['filename']),
-                'diff': f.get('patch', ''),
-            })
-        return files
-    except requests.exceptions.RequestException as e:
-        print(f"GitHub: failed to fetch PR files: {e}")
-        return []
-
-
-def gh_get_file_content(file_path, branch, config):
-    import base64
-    repo = config["github"]["repo"]
-    url = f'https://api.github.com/repos/{repo}/contents/{file_path}'
+        subprocess.run(['ollama', '--version'], capture_output=True, check=True)
+    except:
+        print("❌ Ollama not installed!")
+        print("   Install with: curl -fsSL https://ollama.com/install.sh | sh")
+        return False
+    
+    # Start Ollama in background
     try:
-        r = requests.get(url, headers=gh_headers(config), params={'ref': branch})
-        r.raise_for_status()
-        content = r.json().get('content', '')
-        return base64.b64decode(content).decode('utf-8', errors='replace')
-    except requests.exceptions.RequestException as e:
-        print(f"  GitHub: could not fetch {file_path}: {e}")
+        subprocess.Popen(['ollama', 'serve'], 
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+        
+        # Wait for it to start
+        print("⏳ Waiting for Ollama to start...")
+        for i in range(30):
+            time.sleep(1)
+            if check_ollama_running():
+                print("✅ Ollama started successfully!")
+                return True
+            if i % 5 == 0:
+                print(f"   Still waiting... ({i+1}s)")
+        
+        print("❌ Ollama failed to start within 30 seconds")
+        return False
+    except Exception as e:
+        print(f"❌ Failed to start Ollama: {e}")
+        return False
+
+def ensure_ollama_running():
+    """Ensure Ollama is running, start if needed"""
+    if check_ollama_running():
+        print("✅ Ollama is already running")
+        return True
+    
+    return start_ollama()
+
+def get_ollama_model():
+    """Get the Ollama model to use"""
+    config = load_config()
+    ollama_config = config.get('ollama', {})
+    model = ollama_config.get('model', 'qwen2.5-coder:7b')
+    
+    # Check if model exists
+    try:
+        response = requests.get('http://127.0.0.1:11434/api/tags')
+        if response.status_code == 200:
+            models = response.json().get('models', [])
+            model_names = [m.get('name') for m in models]
+            if model not in model_names:
+                print(f"⚠️  Model '{model}' not found. Available: {', '.join(model_names[:5])}")
+                if model_names:
+                    model = model_names[0]
+                    print(f"   Using '{model}' instead")
+    except:
+        pass
+    
+    return model
+
+def review_with_ollama(diff, repo, pr_number, title, platform='github'):
+    """Send diff to Ollama for review"""
+    if not diff:
+        print("   ⚠️  No diff to review")
+        return None
+    
+    # Ensure Ollama is running
+    if not ensure_ollama_running():
+        print("   ❌ Ollama not available, skipping review")
+        return None
+    
+    model = get_ollama_model()
+    
+    # Prepare prompt
+    prompt = f"""
+You are an expert code reviewer. Please review this pull request diff and provide constructive feedback.
+
+Repository: {repo}
+Platform: {platform}
+PR Number: #{pr_number}
+Title: {title}
+
+Diff:
+{diff[:10000]}  # Limit diff size
+
+Please provide your review in the following format:
+
+## Summary
+[Brief summary of the changes]
+
+## Issues Found
+[List any issues, bugs, or potential problems]
+
+## Suggestions
+[Suggestions for improvement]
+
+## Code Quality
+[Comments on code quality, style, and best practices]
+
+## Security Concerns
+[Any security issues to address]
+
+## Performance Impact
+[Any performance implications]
+"""
+    
+    print(f"   🤖 Sending to Ollama ({model})...")
+    
+    try:
+        response = requests.post('http://127.0.0.1:11434/api/generate', 
+                                 json={
+                                     'model': model,
+                                     'prompt': prompt,
+                                     'stream': False,
+                                     'temperature': 0.3
+                                 },
+                                 timeout=120)
+        
+        if response.status_code == 200:
+            result = response.json()
+            review = result.get('response', '')
+            print(f"   ✅ Review received ({len(review)} characters)")
+            return review
+        else:
+            print(f"   ❌ Ollama API error: {response.status_code}")
+            return None
+    except requests.exceptions.Timeout:
+        print("   ❌ Ollama request timed out (2 minutes)")
+        return None
+    except Exception as e:
+        print(f"   ❌ Ollama error: {e}")
         return None
 
+# ============================================
+# GITHUB FUNCTIONS
+# ============================================
 
-def gh_build_prompt_context(changes, branch, config):
-    parts = []
-    total = 0
-    budget = MAX_DIFF_CHARS + MAX_FILE_CHARS
-    for change in changes:
-        path = change.get('new_path', 'unknown')
-        annotated = _annotate_diff(change.get('diff', ''))
-        full_content = gh_get_file_content(path, branch, config)
-        if full_content and len(full_content) > MAX_FILE_CHARS:
-            full_content = full_content[:MAX_FILE_CHARS] + "\n... (truncated)"
-        chunk = f"### FILE: {path}\n"
-        if full_content:
-            chunk += f"#### Full current content:\n```\n{full_content}\n```\n\n"
-        chunk += f"#### Diff (line numbers in [N] prefix):\n{annotated}\n"
-        if total + len(chunk) > budget:
-            remaining = budget - total
-            if remaining > 200:
-                parts.append(chunk[:remaining] + "\n... (truncated)")
-            break
-        parts.append(chunk)
-        total += len(chunk)
-    return "\n".join(parts)
-
-
-def gh_build_diff_position_map(changes):
-    """
-    GitHub inline comments use 'position': the 1-based line offset within the
-    unified diff (counting @@ headers and all +/- lines).
-    Returns {path: {new_line_number: diff_position}}.
-    """
-    pos_map = {}
-    for change in changes:
-        path = change.get('new_path', 'unknown')
-        mapping = {}
-        position = 0
-        new_line = 0
-        for line in change.get('diff', '').splitlines():
-            position += 1
-            if line.startswith('@@'):
-                m = re.search(r'\+(\d+)', line)
-                if m:
-                    new_line = int(m.group(1)) - 1
-            elif not line.startswith('-'):
-                new_line += 1
-                mapping[new_line] = position
-        pos_map[path] = mapping
-    return pos_map
-
-
-def gh_request_review(pr_number, config):
-    repo = config["github"]["repo"]
-    reviewer = config["github"].get("reviewer_username", "sergiorev")
-    url = f'https://api.github.com/repos/{repo}/pulls/{pr_number}/requested_reviewers'
+def get_github_repos_for_user(username):
+    """Get all repos for a GitHub user where the bot has access"""
+    repos = []
+    
     try:
-        r = requests.post(url, headers=gh_headers(config),
-                          json={'reviewers': [reviewer]})
-        r.raise_for_status()
-        print(f"GitHub: requested {reviewer} as reviewer on PR #{pr_number}")
-    except requests.exceptions.RequestException as e:
-        print(f"GitHub: could not request reviewer: {e}")
+        result = subprocess.run(
+            ['gh', 'repo', 'list', username, '--limit', '100', '--json', 'name,owner,url,isPrivate'],
+            capture_output=True,
+            text=True,
+            env={**os.environ}
+        )
+        if result.returncode == 0:
+            repo_list = json.loads(result.stdout)
+            repos = [f"{repo['owner']['login']}/{repo['name']}" for repo in repo_list]
+            print(f"📂 Found {len(repos)} GitHub repos under {username}")
+            return repos
+    except Exception as e:
+        print(f"⚠️  Error listing GitHub repos: {e}")
+    
+    return repos
 
+def get_github_prs_where_reviewer(repo, reviewer_username):
+    """Get open GitHub PRs where the bot is a reviewer"""
+    prs = []
+    
+    try:
+        result = subprocess.run(
+            ['gh', 'pr', 'list', '--repo', repo, '--state', 'open', 
+             '--json', 'number,title,headRefName,author,reviewRequests,reviews,url,additions,deletions,body,createdAt'],
+            capture_output=True,
+            text=True,
+            env={**os.environ}
+        )
+        if result.returncode == 0:
+            all_prs = json.loads(result.stdout)
+            for pr in all_prs:
+                review_requests = pr.get('reviewRequests', [])
+                for req in review_requests:
+                    if req.get('login') == reviewer_username:
+                        prs.append(pr)
+                        break
+        else:
+            if "no open pull requests" not in result.stderr.lower():
+                print(f"   ⚠️  Error: {result.stderr[:100]}")
+    except Exception as e:
+        print(f"   ⚠️  Error: {str(e)[:100]}")
+    
+    return prs
 
-def gh_post_review(pr_number, head_sha, review, changes, config):
-    repo = config["github"]["repo"]
-    reviewer = config["github"].get("reviewer_username", "sergiorev")
-    url = f'https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews'
+def get_github_pr_diff(repo, pr_number):
+    """Get the diff for a GitHub PR"""
+    try:
+        result = subprocess.run(
+            ['gh', 'pr', 'diff', '--repo', repo, str(pr_number)],
+            capture_output=True,
+            text=True,
+            env={**os.environ}
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return None
+    except Exception:
+        return None
 
-    pos_map = gh_build_diff_position_map(changes)
+def post_github_review_comment(repo, pr_number, review_text):
+    """Post review comment to GitHub PR"""
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as f:
+            f.write(review_text)
+            temp_file = f.name
+        
+        result = subprocess.run(
+            ['gh', 'pr', 'comment', '--repo', repo, str(pr_number), '--body-file', temp_file],
+            capture_output=True,
+            text=True,
+            env={**os.environ}
+        )
+        
+        os.unlink(temp_file)
+        
+        if result.returncode == 0:
+            print(f"   ✅ Review comment posted to #{pr_number}")
+            return True
+        else:
+            print(f"   ⚠️  Failed to post comment: {result.stderr[:100]}")
+            return False
+    except Exception as e:
+        print(f"   ⚠️  Error posting comment: {e}")
+        return False
 
-    verdict = review.get("verdict", "APPROVE WITH COMMENTS")
-    gh_event = {
-        "APPROVE": "APPROVE",
-        "APPROVE WITH COMMENTS": "COMMENT",
-        "REJECT": "REQUEST_CHANGES",
-    }.get(verdict, "COMMENT")
+def process_github_prs():
+    """Main function to process GitHub PRs"""
+    print("\n" + "=" * 70)
+    print("🐙 GITHUB PR REVIEW")
+    print("=" * 70)
+    
+    config = load_config()
+    github_config = config.get('github', {})
+    
+    owner = github_config.get('owner') or github_config.get('organization')
+    reviewer = github_config.get('reviewer_username', 'sergiorev')
+    
+    if not owner:
+        print("⚠️  No GitHub owner/organization configured")
+        return []
+    
+    # Setup SSH for GitHub
+    if not setup_ssh_for_service('github', github_config):
+        print("❌ GitHub SSH setup failed")
+        return []
+    
+    print(f"👤 Bot user: {reviewer}")
+    print(f"📂 Owner: {owner}")
+    print("")
+    
+    # Get all repos
+    repos = get_github_repos_for_user(owner)
+    if not repos:
+        print("❌ No GitHub repos found")
+        return []
+    
+    # Check each repo for PRs
+    all_prs = []
+    for i, repo in enumerate(repos, 1):
+        print(f"[{i}/{len(repos)}] 🔍 Checking {repo}...")
+        prs = get_github_prs_where_reviewer(repo, reviewer)
+        if prs:
+            print(f"   ✅ Found {len(prs)} PR(s)")
+            for pr in prs:
+                print(f"      • #{pr['number']}: {pr['title']} (by @{pr.get('author', {}).get('login', 'unknown')})")
+                print(f"        URL: {pr['url']}")
+                print(f"        +{pr.get('additions', 0)} -{pr.get('deletions', 0)} lines")
+            all_prs.extend([{'repo': repo, 'pr': pr, 'platform': 'github'} for pr in prs])
+        else:
+            print(f"   ❌ No PRs found")
+    
+    # Process each PR with Ollama
+    if all_prs:
+        print("\n" + "=" * 70)
+        print("🤖 REVIEWING PRS WITH OLLAMA")
+        print("=" * 70)
+        
+        for item in all_prs:
+            repo = item['repo']
+            pr = item['pr']
+            pr_number = pr['number']
+            title = pr['title']
+            
+            print(f"\n📝 Reviewing PR #{pr_number}: {title}")
+            print(f"   Repository: {repo}")
+            
+            # Get the diff
+            print(f"   📄 Fetching diff...")
+            diff = get_github_pr_diff(repo, pr_number)
+            
+            if diff:
+                print(f"   ✅ Diff size: {len(diff)} characters")
+                
+                # Review with Ollama
+                review = review_with_ollama(diff, repo, pr_number, title, 'github')
+                
+                if review:
+                    print(f"\n   📋 Review summary:")
+                    # Print first few lines of review
+                    summary_lines = review.split('\n')[:5]
+                    for line in summary_lines:
+                        if line.strip():
+                            print(f"      {line}")
+                    print(f"      ... (full review in PR comment)")
+                    
+                    # Post comment to PR
+                    post_github_review_comment(repo, pr_number, review)
+                else:
+                    print(f"   ⚠️  No review generated")
+            else:
+                print(f"   ❌ Failed to fetch diff")
+    
+    print(f"\n📊 GitHub total: {len(all_prs)} PR(s) found")
+    return all_prs
 
-    verdict_emoji = {"APPROVE": "✅", "APPROVE WITH COMMENTS": "⚠️", "REJECT": "❌"}.get(verdict, "🔍")
-    body = (f"## {verdict_emoji} Sergio Ramos (@{reviewer}) — Code Review\n\n"
-            f"{review.get('summary', '_No summary provided._')}")
+# ============================================
+# GITLAB FUNCTIONS
+# ============================================
 
-    comments = []
-    failed_inline = []
-    for ic in review.get("inline_comments", []):
-        file_path = ic.get("file", "")
-        line = ic.get("line")
-        comment_text = ic.get("comment", "")
-        position = pos_map.get(file_path, {}).get(line)
-        if position is None:
-            print(f"  GitHub: invalid position skipped: {file_path}:{line}")
-            failed_inline.append(ic)
-            continue
-        comments.append({
-            "path": file_path,
-            "position": position,
-            "body": f"**Sergio Ramos** (@{reviewer}):\n\n{comment_text}",
-        })
-
-    if failed_inline:
-        body += "\n\n---\n### Comments (could not be posted inline)\n\n"
-        for ic in failed_inline:
-            body += f"**`{ic.get('file')}` line {ic.get('line')}:** {ic.get('comment')}\n\n"
-
-    payload = {
-        "commit_id": head_sha,
-        "body": body,
-        "event": gh_event,
-        "comments": comments,
+def get_gitlab_mrs_where_reviewer(project_id, reviewer_username, gitlab_token):
+    """Get open GitLab MRs where the bot is a reviewer"""
+    mrs = []
+    
+    url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests"
+    params = {
+        'state': 'opened',
+        'per_page': 100,
+        'view': 'simple'
     }
-
+    headers = {'PRIVATE-TOKEN': gitlab_token}
+    
     try:
-        r = requests.post(url, headers=gh_headers(config), json=payload)
-        r.raise_for_status()
-        print(f"GitHub: review posted on PR #{pr_number} ({gh_event}, {len(comments)} inline comment(s))")
-    except requests.exceptions.RequestException as e:
-        print(f"GitHub: failed to post review: {e}")
-        # Fallback: plain issue comment
-        fallback_url = f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments'
-        try:
-            requests.post(fallback_url, headers=gh_headers(config), json={'body': body})
-            print(f"GitHub: fallback comment posted on PR #{pr_number}")
-        except Exception:
-            print("GitHub: fallback comment also failed.")
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            all_mrs = response.json()
+            for mr in all_mrs:
+                reviewers = mr.get('reviewers', [])
+                for reviewer in reviewers:
+                    if reviewer.get('username') == reviewer_username:
+                        mrs.append(mr)
+                        break
+                
+                if not mrs or mrs[-1] != mr:
+                    assignees = mr.get('assignees', [])
+                    for assignee in assignees:
+                        if assignee.get('username') == reviewer_username:
+                            mrs.append(mr)
+                            break
+        else:
+            print(f"   ⚠️  GitLab API error: {response.status_code}")
+    except Exception as e:
+        print(f"   ⚠️  GitLab error: {e}")
+    
+    return mrs
 
+def get_gitlab_mr_diff(project_id, mr_iid, gitlab_token):
+    """Get the diff for a GitLab MR"""
+    url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests/{mr_iid}/diffs"
+    headers = {'PRIVATE-TOKEN': gitlab_token}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            diffs = response.json()
+            diff_text = ""
+            for diff in diffs:
+                diff_text += f"diff --git a/{diff.get('old_path')} b/{diff.get('new_path')}\n"
+                diff_text += diff.get('diff', '')
+                diff_text += "\n"
+            return diff_text
+        return None
+    except Exception:
+        return None
 
-def run_github(config):
-    prs = gh_get_open_prs(config)
-    if not prs:
-        print("GitHub: no open (non-draft) PRs found.")
-        return
+def post_gitlab_review_comment(project_id, mr_iid, review_text, gitlab_token):
+    """Post review comment to GitLab MR"""
+    url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes"
+    headers = {'PRIVATE-TOKEN': gitlab_token}
+    data = {'body': review_text}
+    
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 201:
+            print(f"   ✅ Review comment posted to !{mr_iid}")
+            return True
+        else:
+            print(f"   ⚠️  Failed to post comment: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"   ⚠️  Error posting comment: {e}")
+        return False
 
-    pr = sorted(prs, key=lambda x: x['updated_at'], reverse=True)[0]
-    pr_number = pr['number']
-    head_sha = pr['head']['sha']
-    branch = pr['head']['ref']
-    print(f"GitHub: PR #{pr_number}: {pr['title']}")
+def process_gitlab_mrs():
+    """Main function to process GitLab MRs"""
+    print("\n" + "=" * 70)
+    print("🦊 GITLAB MR REVIEW")
+    print("=" * 70)
+    
+    config = load_config()
+    gitlab_config = config.get('gitlab', {})
+    
+    project_id = gitlab_config.get('project_id')
+    reviewer = gitlab_config.get('reviewer_username', 'sergioram')
+    token = gitlab_config.get('token')
+    
+    if not project_id:
+        print("⚠️  No GitLab project_id configured")
+        return []
+    
+    if not token:
+        print("⚠️  No GitLab token configured")
+        return []
+    
+    print(f"👤 Bot user: {reviewer}")
+    print(f"📂 Project ID: {project_id}")
+    print("")
+    
+    # Get MRs where bot is a reviewer
+    print(f"🔍 Checking GitLab project {project_id} for MRs assigned to {reviewer}...")
+    mrs = get_gitlab_mrs_where_reviewer(project_id, reviewer, token)
+    
+    if mrs:
+        print(f"   ✅ Found {len(mrs)} MR(s)")
+        for mr in mrs:
+            print(f"      • !{mr['iid']}: {mr['title']} (by @{mr.get('author', {}).get('username', 'unknown')})")
+            print(f"        URL: {mr['web_url']}")
+            print(f"        +{mr.get('additions', 0)} -{mr.get('deletions', 0)} lines")
+    else:
+        print(f"   ❌ No MRs found")
+    
+    # Process each MR with Ollama
+    if mrs:
+        print("\n" + "=" * 70)
+        print("🤖 REVIEWING MRS WITH OLLAMA")
+        print("=" * 70)
+        
+        for mr in mrs:
+            mr_iid = mr['iid']
+            title = mr['title']
+            
+            print(f"\n📝 Reviewing MR !{mr_iid}: {title}")
+            print(f"   Project: {project_id}")
+            
+            # Get the diff
+            print(f"   📄 Fetching diff...")
+            diff = get_gitlab_mr_diff(project_id, mr_iid, token)
+            
+            if diff:
+                print(f"   ✅ Diff size: {len(diff)} characters")
+                
+                # Review with Ollama
+                review = review_with_ollama(diff, f"project_{project_id}", mr_iid, title, 'gitlab')
+                
+                if review:
+                    print(f"\n   📋 Review summary:")
+                    summary_lines = review.split('\n')[:5]
+                    for line in summary_lines:
+                        if line.strip():
+                            print(f"      {line}")
+                    print(f"      ... (full review in MR comment)")
+                    
+                    # Post comment to MR
+                    post_gitlab_review_comment(project_id, mr_iid, review, token)
+                else:
+                    print(f"   ⚠️  No review generated")
+            else:
+                print(f"   ❌ Failed to fetch diff")
+    
+    print(f"\n📊 GitLab total: {len(mrs)} MR(s) found")
+    return mrs
 
-    changes = gh_get_pr_files(pr_number, config)
-    if not changes:
-        print("GitHub: no changed files found.")
-        return
-
-    print(f"GitHub: changed files: {[c['new_path'] for c in changes]}")
-    gh_request_review(pr_number, config)
-
-    prompt_context = gh_build_prompt_context(changes, branch, config)
-    review = ollama_review(prompt_context, pr['title'])
-    reviewer = config["github"].get("reviewer_username", "sergiorev")
-
-    if not review:
-        repo = config["github"]["repo"]
-        fallback_url = f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments'
-        requests.post(fallback_url, headers=gh_headers(config),
-                      json={'body': f"⚠️ **Sergio Ramos** (@{reviewer}): review failed (Ollama unavailable or bad JSON)."})
-        save_context({'github_pr_number': pr_number})
-        return
-
-    gh_post_review(pr_number, head_sha, review, changes, config)
-    save_context({'github_pr_number': pr_number})
-    print("GitHub: done.")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ============================================
+# MAIN FUNCTION
+# ============================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sergio Ramos — automated code reviewer",
-        epilog="With no flags, both GitLab MRs and GitHub PRs are reviewed."
-    )
-    parser.add_argument('--config', default='config.yml', help='Path to config file (default: config.yml)')
-    parser.add_argument('--gitlab', action='store_true', help='Review GitLab MRs only')
-    parser.add_argument('--github', action='store_true', help='Review GitHub PRs only')
-    args = parser.parse_args()
+    print("=" * 70)
+    print("🤖 Sergio Bot - Multi-Platform Code Review Automation")
+    print("=" * 70)
+    
+    # Process GitHub PRs
+    github_prs = process_github_prs()
+    
+    # Process GitLab MRs
+    gitlab_mrs = process_gitlab_mrs()
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("📊 SUMMARY")
+    print("=" * 70)
+    print(f"🐙 GitHub: {len(github_prs)} PR(s) found")
+    print(f"🦊 GitLab: {len(gitlab_mrs)} MR(s) found")
+    print(f"📦 Total: {len(github_prs) + len(gitlab_mrs)} items to review")
+    print("=" * 70)
 
-    config = load_config(args.config)
-
-    # No flags = run both
-    run_gl = args.gitlab or (not args.gitlab and not args.github)
-    run_gh = args.github or (not args.gitlab and not args.github)
-
-    if run_gl:
-        if "gitlab" not in config:
-            print("GitLab config missing — skipping.")
-        else:
-            run_gitlab(config)
-
-    if run_gh:
-        if "github" not in config:
-            print("GitHub config missing — skipping.")
-        else:
-            run_github(config)
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
