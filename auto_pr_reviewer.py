@@ -8,9 +8,260 @@ import re
 import requests
 import time
 
+# Available models for selection
+AVAILABLE_MODELS = {
+    '1': {
+        'name': 'codellama:7b',
+        'description': 'Code-specific model (best for code review)',
+        'speed': 'Medium',
+        'quality': 'Excellent',
+        'timeout': 300
+    },
+    '2': {
+        'name': 'mistral:7b',
+        'description': 'Fast general-purpose model',
+        'speed': 'Fast',
+        'quality': 'Very Good',
+        'timeout': 150
+    },
+    '3': {
+        'name': 'neural-chat:7b',
+        'description': 'Lightweight, optimized for conversations (recommended)',
+        'speed': 'Very Fast',
+        'quality': 'Good',
+        'timeout': 150
+    },
+    '4': {
+        'name': 'stable-code:3b',
+        'description': 'Ultra-lightweight code model (fastest)',
+        'speed': 'Ultra Fast',
+        'quality': 'Good',
+        'timeout': 120
+    },
+    '5': {
+        'name': 'qwen2.5-coder:7b',
+        'description': 'Default model (slowest but detailed)',
+        'speed': 'Slow',
+        'quality': 'Excellent',
+        'timeout': 300
+    }
+}
+
 def load_config():
-    with open('config.yml', 'r') as f:
-        return yaml.safe_load(f)
+    try:
+        with open('config.yml', 'r') as f:
+            return yaml.safe_load(f)
+    except:
+        return {}
+
+# ─── DOCKER OLLAMA FUNCTIONS ──────────────────────────────────────────────────
+
+def check_ollama_container_running():
+    """Check if the Ollama Docker container is running"""
+    try:
+        result = subprocess.run(
+            ['docker', 'ps', '--filter', 'name=ollama', '--format', '{{.Status}}'],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0 and 'Up' in result.stdout
+    except:
+        return False
+
+def check_ollama_api_ready():
+    """Check if Ollama API is responding"""
+    try:
+        response = requests.get('http://127.0.0.1:11434/api/tags', timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def start_ollama_via_node():
+    """Start Ollama using the Node.js script"""
+    print("🔄 Starting Ollama container via ollama-start.js...")
+    
+    # Check if the Node script exists in various locations
+    script_paths = [
+        os.path.join(os.path.dirname(__file__), 'ollama-start.js'),
+        './ollama-start.js',
+        os.path.expanduser('~/src/coderev/ollama-start.js'),
+        '/home/amitp/src/coderev/ollama-start.js'
+    ]
+    
+    script_path = None
+    for path in script_paths:
+        if os.path.exists(path):
+            script_path = path
+            break
+    
+    if not script_path:
+        print("❌ ollama-start.js not found!")
+        print("   Please ensure ollama-start.js is in the current directory")
+        return False
+    
+    try:
+        # Start the Node script in the background with output redirected
+        process = subprocess.Popen(
+            ['node', script_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        
+        # Wait up to 60 seconds for Ollama to be ready
+        print("⏳ Waiting for Ollama container to start...")
+        for i in range(60):
+            time.sleep(1)
+            if check_ollama_api_ready():
+                print("✅ Ollama container started and API is ready!")
+                return True
+            if i % 10 == 0 and i > 0:
+                print(f"   Still waiting... ({i}s)")
+        
+        print("❌ Ollama container failed to start within 60 seconds")
+        print("   Check: docker logs ollama")
+        return False
+        
+    except Exception as e:
+        print(f"❌ Failed to start Ollama via Node: {e}")
+        return False
+
+def ensure_ollama_running():
+    """Ensure Ollama is running (using Docker container)"""
+    
+    # First check if the Docker container is already running
+    if check_ollama_container_running():
+        # Check if API is ready
+        if check_ollama_api_ready():
+            print("✅ Ollama container is running")
+            return True
+        else:
+            print("⏳ Ollama container running but API not ready yet...")
+            # Wait a bit for API to become ready
+            for i in range(10):
+                time.sleep(1)
+                if check_ollama_api_ready():
+                    print("✅ Ollama API is now ready!")
+                    return True
+            print("⚠️  API still not responding, attempting restart...")
+    
+    # If container isn't running or API isn't ready, start it
+    return start_ollama_via_node()
+
+def pull_model(model_name):
+    """Pull a model from Ollama Hub using the Docker container"""
+    print(f"\n📥 Pulling model: {model_name}...")
+    print(f"   This may take a few minutes (model is ~4-5GB)...\n")
+    
+    try:
+        subprocess.run(['docker', 'exec', 'ollama', 'ollama', 'pull', model_name], check=True)
+        print(f"\n✅ Model {model_name} installed successfully!\n")
+        return True
+    except subprocess.CalledProcessError:
+        print(f"\n❌ Failed to pull {model_name}")
+        return False
+    except FileNotFoundError:
+        print(f"\n❌ Docker not installed or not running!")
+        return False
+
+def get_installed_models():
+    """Get list of currently installed models from Docker container"""
+    try:
+        result = subprocess.run(
+            ['docker', 'exec', 'ollama', 'ollama', 'list'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            # Parse the output (skip header line)
+            models = []
+            for line in result.stdout.strip().split('\n')[1:]:
+                if line.strip():
+                    # Extract model name (first field)
+                    parts = line.split()
+                    if parts:
+                        models.append(parts[0])
+            return models
+    except:
+        pass
+    return []
+
+def select_model_interactive():
+    """Prompt user to select a model - shows ALL models and auto-pulls if needed"""
+    print("\n" + "=" * 70)
+    print("🤖 SELECT CODE REVIEW MODEL")
+    print("=" * 70)
+    
+    # Make sure Ollama is running before checking models
+    if not ensure_ollama_running():
+        print("❌ Cannot proceed without Ollama running")
+        sys.exit(1)
+    
+    # Get installed models
+    print("\n📦 Checking installed models...\n")
+    installed_names = get_installed_models()
+    
+    # Show ALL 5 models with status
+    print("Available models:\n")
+    for key in sorted(AVAILABLE_MODELS.keys()):
+        model = AVAILABLE_MODELS[key]
+        status = "✅ INSTALLED" if model['name'] in installed_names else "⬇️  NOT INSTALLED"
+        print(f"  {key}️⃣  {model['name']:<25} [{status}]")
+        print(f"     {model['description']}")
+        print(f"     Speed: {model['speed']} | Quality: {model['quality']}")
+        print()
+    
+    # Get config default
+    config = load_config()
+    default_model = config.get('ollama', {}).get('model', 'qwen2.5-coder:7b')
+    default_key = None
+    for key, model in AVAILABLE_MODELS.items():
+        if model['name'] == default_model:
+            default_key = key
+            break
+    
+    if default_key:
+        print(f"📌 Default from config: {default_key} ({default_model})\n")
+    
+    # Prompt for selection - accept numbers 1-5
+    while True:
+        prompt = f"Enter model number (1-5) [{default_key if default_key else '1'}]: "
+        choice = input(prompt).strip()
+        
+        # Use default if empty input
+        if not choice:
+            choice = default_key if default_key else '1'
+        
+        # Validate it's a valid number
+        if choice not in AVAILABLE_MODELS:
+            print(f"❌ Invalid! Enter a number between 1-5\n")
+            continue
+        
+        selected = AVAILABLE_MODELS[choice]
+        model_name = selected['name']
+        
+        # Refresh installed list
+        installed_names = get_installed_models()
+        
+        # Check if model is installed
+        if model_name not in installed_names:
+            print(f"\n⚠️  Model {model_name} is not installed")
+            response = input(f"Do you want to download it now? (y/n) [y]: ").strip().lower()
+            
+            if response != 'n':
+                if not pull_model(model_name):
+                    print("Continuing without this model...\n")
+                    continue
+                # After pulling, refresh and continue
+                installed_names = get_installed_models()
+            else:
+                print("Skipping this model. Choose another...\n")
+                continue
+        
+        print(f"✅ Selected: {model_name}")
+        print(f"   {selected['description']}")
+        print(f"   Timeout: {selected['timeout']}s\n")
+        return model_name, selected['timeout']
 
 def setup_ssh_for_service(service, config):
     """Setup SSH for a specific service"""
@@ -30,85 +281,39 @@ def setup_ssh_for_service(service, config):
         return False
 
 # ============================================
-# OLLAMA FUNCTIONS
+# DIFF CHUNKING FUNCTIONS
 # ============================================
 
-def check_ollama_running():
-    """Check if Ollama is running"""
-    try:
-        response = requests.get('http://127.0.0.1:11434/api/tags', timeout=2)
-        if response.status_code == 200:
-            return True
-    except:
-        pass
-    return False
-
-def start_ollama():
-    """Start Ollama if not running"""
-    print("🔄 Ollama not running. Attempting to start...")
+def chunk_diff(diff, max_chunk_size=15000):
+    """Split large diffs into smaller chunks for Ollama processing."""
+    if len(diff) <= max_chunk_size:
+        return [diff]
     
-    # Check if ollama is installed
-    try:
-        subprocess.run(['ollama', '--version'], capture_output=True, check=True)
-    except:
-        print("❌ Ollama not installed!")
-        print("   Install with: curl -fsSL https://ollama.com/install.sh | sh")
-        return False
+    chunks = []
+    current_chunk = ""
     
-    # Start Ollama in background
-    try:
-        subprocess.Popen(['ollama', 'serve'], 
-                        stdout=subprocess.DEVNULL, 
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True)
+    file_diffs = re.split(r'(diff --git [^\n]+\n)', diff)
+    
+    for i, part in enumerate(file_diffs):
+        if not part.strip():
+            continue
         
-        # Wait for it to start
-        print("⏳ Waiting for Ollama to start...")
-        for i in range(30):
-            time.sleep(1)
-            if check_ollama_running():
-                print("✅ Ollama started successfully!")
-                return True
-            if i % 5 == 0:
-                print(f"   Still waiting... ({i+1}s)")
-        
-        print("❌ Ollama failed to start within 30 seconds")
-        return False
-    except Exception as e:
-        print(f"❌ Failed to start Ollama: {e}")
-        return False
-
-def ensure_ollama_running():
-    """Ensure Ollama is running, start if needed"""
-    if check_ollama_running():
-        print("✅ Ollama is already running")
-        return True
+        if len(current_chunk) + len(part) > max_chunk_size and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = part
+        else:
+            current_chunk += part
     
-    return start_ollama()
-
-def get_ollama_model():
-    """Get the Ollama model to use"""
-    config = load_config()
-    ollama_config = config.get('ollama', {})
-    model = ollama_config.get('model', 'qwen2.5-coder:7b')
+    if current_chunk.strip():
+        chunks.append(current_chunk)
     
-    # Check if model exists
-    try:
-        response = requests.get('http://127.0.0.1:11434/api/tags')
-        if response.status_code == 200:
-            models = response.json().get('models', [])
-            model_names = [m.get('name') for m in models]
-            if model not in model_names:
-                print(f"⚠️  Model '{model}' not found. Available: {', '.join(model_names[:5])}")
-                if model_names:
-                    model = model_names[0]
-                    print(f"   Using '{model}' instead")
-    except:
-        pass
-    
-    return model
+    return chunks if chunks else [diff]
 
-def review_with_ollama(diff, repo, pr_number, title, platform='github'):
+# ============================================
+# OLLAMA REVIEW FUNCTIONS
+# ============================================
+
+def review_with_ollama(diff, repo, pr_number, title, model, timeout, platform='github'):
     """Send diff to Ollama for review"""
     if not diff:
         print("   ⚠️  No diff to review")
@@ -119,19 +324,28 @@ def review_with_ollama(diff, repo, pr_number, title, platform='github'):
         print("   ❌ Ollama not available, skipping review")
         return None
     
-    model = get_ollama_model()
+    chunks = chunk_diff(diff, max_chunk_size=15000)
     
-    # Prepare prompt
-    prompt = f"""
-You are an expert code reviewer. Please review this pull request diff and provide constructive feedback.
+    if len(chunks) > 1:
+        print(f"   📦 Large diff split into {len(chunks)} chunks")
+    
+    all_reviews = []
+    
+    for chunk_idx, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"   📝 Processing chunk {chunk_idx + 1}/{len(chunks)}...")
+        
+        prompt = f"""
+You are an expert code reviewer. Please review this code diff and provide constructive feedback.
 
 Repository: {repo}
 Platform: {platform}
 PR Number: #{pr_number}
 Title: {title}
+{"(Part " + str(chunk_idx + 1) + " of " + str(len(chunks)) + ")" if len(chunks) > 1 else ""}
 
 Diff:
-{diff[:10000]}  # Limit diff size
+{chunk}
 
 Please provide your review in the following format:
 
@@ -153,40 +367,50 @@ Please provide your review in the following format:
 ## Performance Impact
 [Any performance implications]
 """
-    
-    print(f"   🤖 Sending to Ollama ({model})...")
-    
-    try:
-        response = requests.post('http://127.0.0.1:11434/api/generate', 
-                                 json={
-                                     'model': model,
-                                     'prompt': prompt,
-                                     'stream': False,
-                                     'temperature': 0.3
-                                 },
-                                 timeout=120)
         
-        if response.status_code == 200:
-            result = response.json()
-            review = result.get('response', '')
-            print(f"   ✅ Review received ({len(review)} characters)")
-            return review
-        else:
-            print(f"   ❌ Ollama API error: {response.status_code}")
+        print(f"   🤖 Sending to Ollama ({model})...")
+        
+        try:
+            response = requests.post('http://127.0.0.1:11434/api/generate', 
+                                     json={
+                                         'model': model,
+                                         'prompt': prompt,
+                                         'stream': False,
+                                         'temperature': 0.3
+                                     },
+                                     timeout=timeout)
+            
+            if response.status_code == 200:
+                result = response.json()
+                review = result.get('response', '')
+                print(f"   ✅ Review received ({len(review)} characters)")
+                all_reviews.append(review)
+            else:
+                print(f"   ❌ Ollama API error: {response.status_code}")
+                return None
+        except requests.exceptions.Timeout:
+            print(f"   ❌ Ollama request timed out ({timeout}s)")
+            print(f"      Try a faster model from the selection menu")
             return None
-    except requests.exceptions.Timeout:
-        print("   ❌ Ollama request timed out (2 minutes)")
-        return None
-    except Exception as e:
-        print(f"   ❌ Ollama error: {e}")
-        return None
+        except Exception as e:
+            print(f"   ❌ Ollama error: {e}")
+            return None
+    
+    if all_reviews:
+        if len(all_reviews) > 1:
+            combined_review = f"## Code Review Summary (Analyzed {len(chunks)} parts)\n\n" + "\n\n---\n\n".join(all_reviews)
+        else:
+            combined_review = all_reviews[0]
+        return combined_review
+    
+    return None
 
 # ============================================
 # GITHUB FUNCTIONS
 # ============================================
 
 def get_github_repos_for_user(username):
-    """Get all repos for a GitHub user where the bot has access"""
+    """Get all repos for a GitHub user"""
     repos = []
     
     try:
@@ -226,9 +450,6 @@ def get_github_prs_where_reviewer(repo, reviewer_username):
                     if req.get('login') == reviewer_username:
                         prs.append(pr)
                         break
-        else:
-            if "no open pull requests" not in result.stderr.lower():
-                print(f"   ⚠️  Error: {result.stderr[:100]}")
     except Exception as e:
         print(f"   ⚠️  Error: {str(e)[:100]}")
     
@@ -245,29 +466,29 @@ def get_github_pr_diff(repo, pr_number):
         )
         if result.returncode == 0:
             return result.stdout
-        return None
-    except Exception:
-        return None
+    except Exception as e:
+        print(f"   ⚠️  Error: {str(e)[:100]}")
+    
+    return None
 
 def post_github_review_comment(repo, pr_number, review_text):
     """Post review comment to GitHub PR"""
+    if not review_text:
+        return
+    
+    max_comment_size = 65000
+    if len(review_text) > max_comment_size:
+        review_text = review_text[:max_comment_size] + f"\n\n... (truncated, {len(review_text) - max_comment_size} characters omitted)"
+    
     try:
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as f:
-            f.write(review_text)
-            temp_file = f.name
-        
         result = subprocess.run(
-            ['gh', 'pr', 'comment', '--repo', repo, str(pr_number), '--body-file', temp_file],
+            ['gh', 'pr', 'comment', '--repo', repo, str(pr_number), '--body', review_text],
             capture_output=True,
             text=True,
             env={**os.environ}
         )
-        
-        os.unlink(temp_file)
-        
         if result.returncode == 0:
-            print(f"   ✅ Review comment posted to #{pr_number}")
+            print(f"   ✅ Review comment posted to PR #{pr_number}")
             return True
         else:
             print(f"   ⚠️  Failed to post comment: {result.stderr[:100]}")
@@ -276,7 +497,7 @@ def post_github_review_comment(repo, pr_number, review_text):
         print(f"   ⚠️  Error posting comment: {e}")
         return False
 
-def process_github_prs():
+def process_github_prs(model, timeout):
     """Main function to process GitHub PRs"""
     print("\n" + "=" * 70)
     print("🐙 GITHUB PR REVIEW")
@@ -285,29 +506,22 @@ def process_github_prs():
     config = load_config()
     github_config = config.get('github', {})
     
-    owner = github_config.get('owner') or github_config.get('organization')
+    if not setup_ssh_for_service('github', github_config):
+        print("⚠️  Could not setup GitHub SSH")
+        return []
+    
+    username = github_config.get('username', 'aperelman')
     reviewer = github_config.get('reviewer_username', 'sergiorev')
     
-    if not owner:
-        print("⚠️  No GitHub owner/organization configured")
-        return []
-    
-    # Setup SSH for GitHub
-    if not setup_ssh_for_service('github', github_config):
-        print("❌ GitHub SSH setup failed")
-        return []
-    
     print(f"👤 Bot user: {reviewer}")
-    print(f"📂 Owner: {owner}")
+    print(f"📂 Owner: {username}")
     print("")
     
-    # Get all repos
-    repos = get_github_repos_for_user(owner)
+    repos = get_github_repos_for_user(username)
     if not repos:
-        print("❌ No GitHub repos found")
+        print("❌ No repos found")
         return []
     
-    # Check each repo for PRs
     all_prs = []
     for i, repo in enumerate(repos, 1):
         print(f"[{i}/{len(repos)}] 🔍 Checking {repo}...")
@@ -322,7 +536,6 @@ def process_github_prs():
         else:
             print(f"   ❌ No PRs found")
     
-    # Process each PR with Ollama
     if all_prs:
         print("\n" + "=" * 70)
         print("🤖 REVIEWING PRS WITH OLLAMA")
@@ -337,26 +550,22 @@ def process_github_prs():
             print(f"\n📝 Reviewing PR #{pr_number}: {title}")
             print(f"   Repository: {repo}")
             
-            # Get the diff
             print(f"   📄 Fetching diff...")
             diff = get_github_pr_diff(repo, pr_number)
             
             if diff:
                 print(f"   ✅ Diff size: {len(diff)} characters")
                 
-                # Review with Ollama
-                review = review_with_ollama(diff, repo, pr_number, title, 'github')
+                review = review_with_ollama(diff, repo, pr_number, title, model, timeout, 'github')
                 
                 if review:
                     print(f"\n   📋 Review summary:")
-                    # Print first few lines of review
                     summary_lines = review.split('\n')[:5]
                     for line in summary_lines:
                         if line.strip():
                             print(f"      {line}")
                     print(f"      ... (full review in PR comment)")
                     
-                    # Post comment to PR
                     post_github_review_comment(repo, pr_number, review)
                 else:
                     print(f"   ⚠️  No review generated")
@@ -392,15 +601,6 @@ def get_gitlab_mrs_where_reviewer(project_id, reviewer_username, gitlab_token):
                     if reviewer.get('username') == reviewer_username:
                         mrs.append(mr)
                         break
-                
-                if not mrs or mrs[-1] != mr:
-                    assignees = mr.get('assignees', [])
-                    for assignee in assignees:
-                        if assignee.get('username') == reviewer_username:
-                            mrs.append(mr)
-                            break
-        else:
-            print(f"   ⚠️  GitLab API error: {response.status_code}")
     except Exception as e:
         print(f"   ⚠️  GitLab error: {e}")
     
@@ -421,9 +621,10 @@ def get_gitlab_mr_diff(project_id, mr_iid, gitlab_token):
                 diff_text += diff.get('diff', '')
                 diff_text += "\n"
             return diff_text
-        return None
     except Exception:
-        return None
+        pass
+    
+    return None
 
 def post_gitlab_review_comment(project_id, mr_iid, review_text, gitlab_token):
     """Post review comment to GitLab MR"""
@@ -436,14 +637,12 @@ def post_gitlab_review_comment(project_id, mr_iid, review_text, gitlab_token):
         if response.status_code == 201:
             print(f"   ✅ Review comment posted to !{mr_iid}")
             return True
-        else:
-            print(f"   ⚠️  Failed to post comment: {response.status_code}")
-            return False
     except Exception as e:
         print(f"   ⚠️  Error posting comment: {e}")
-        return False
+    
+    return False
 
-def process_gitlab_mrs():
+def process_gitlab_mrs(model, timeout):
     """Main function to process GitLab MRs"""
     print("\n" + "=" * 70)
     print("🦊 GITLAB MR REVIEW")
@@ -468,20 +667,16 @@ def process_gitlab_mrs():
     print(f"📂 Project ID: {project_id}")
     print("")
     
-    # Get MRs where bot is a reviewer
     print(f"🔍 Checking GitLab project {project_id} for MRs assigned to {reviewer}...")
     mrs = get_gitlab_mrs_where_reviewer(project_id, reviewer, token)
     
     if mrs:
         print(f"   ✅ Found {len(mrs)} MR(s)")
         for mr in mrs:
-            print(f"      • !{mr['iid']}: {mr['title']} (by @{mr.get('author', {}).get('username', 'unknown')})")
-            print(f"        URL: {mr['web_url']}")
-            print(f"        +{mr.get('additions', 0)} -{mr.get('deletions', 0)} lines")
+            print(f"      • !{mr['iid']}: {mr['title']}")
     else:
         print(f"   ❌ No MRs found")
     
-    # Process each MR with Ollama
     if mrs:
         print("\n" + "=" * 70)
         print("🤖 REVIEWING MRS WITH OLLAMA")
@@ -494,15 +689,13 @@ def process_gitlab_mrs():
             print(f"\n📝 Reviewing MR !{mr_iid}: {title}")
             print(f"   Project: {project_id}")
             
-            # Get the diff
             print(f"   📄 Fetching diff...")
             diff = get_gitlab_mr_diff(project_id, mr_iid, token)
             
             if diff:
                 print(f"   ✅ Diff size: {len(diff)} characters")
                 
-                # Review with Ollama
-                review = review_with_ollama(diff, f"project_{project_id}", mr_iid, title, 'gitlab')
+                review = review_with_ollama(diff, f"project_{project_id}", mr_iid, title, model, timeout, 'gitlab')
                 
                 if review:
                     print(f"\n   📋 Review summary:")
@@ -512,7 +705,6 @@ def process_gitlab_mrs():
                             print(f"      {line}")
                     print(f"      ... (full review in MR comment)")
                     
-                    # Post comment to MR
                     post_gitlab_review_comment(project_id, mr_iid, review, token)
                 else:
                     print(f"   ⚠️  No review generated")
@@ -531,16 +723,20 @@ def main():
     print("🤖 Sergio Bot - Multi-Platform Code Review Automation")
     print("=" * 70)
     
+    # Select model (with auto-pull)
+    model, timeout = select_model_interactive()
+    
     # Process GitHub PRs
-    github_prs = process_github_prs()
+    github_prs = process_github_prs(model, timeout)
     
     # Process GitLab MRs
-    gitlab_mrs = process_gitlab_mrs()
+    gitlab_mrs = process_gitlab_mrs(model, timeout)
     
     # Summary
     print("\n" + "=" * 70)
     print("📊 SUMMARY")
     print("=" * 70)
+    print(f"🤖 Model used: {model} (timeout: {timeout}s)")
     print(f"🐙 GitHub: {len(github_prs)} PR(s) found")
     print(f"🦊 GitLab: {len(gitlab_mrs)} MR(s) found")
     print(f"📦 Total: {len(github_prs) + len(gitlab_mrs)} items to review")
