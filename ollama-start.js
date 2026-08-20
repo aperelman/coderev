@@ -1,0 +1,1 @@
+/home/amitp/.local/bin/ollama-start.js
