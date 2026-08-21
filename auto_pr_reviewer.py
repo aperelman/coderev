@@ -263,28 +263,26 @@ def get_gitlab_mrs_with_sergio(config):
         url = "https://gitlab.com/api/v4/merge_requests"
         headers = {'PRIVATE-TOKEN': token.strip()}
         
-        # Get all open MRs
+        # Get open MRs where reviewer_username is sergioram (using API filter)
         r = requests.get(url, headers=headers, params={
             'state': 'opened',
-            'per_page': 100
+            'reviewer_username': reviewer_username,
+            'per_page': 100,
+            'scope': 'all',
         }, timeout=10)
         r.raise_for_status()
         
         all_mrs = r.json()
         
-        # Filter: where sergio is reviewer
+        # All returned MRs already have sergio as reviewer
         for mr in all_mrs:
-            reviewers = mr.get('reviewers', [])
-            for reviewer in reviewers:
-                if reviewer.get('username') == reviewer_username:
-                    mrs.append({
-                        'platform': 'gitlab',
-                        'project_id': mr['project_id'],
-                        'iid': mr['iid'],
-                        'title': mr['title'],
-                        'web_url': mr['web_url']
-                    })
-                    break
+            mrs.append({
+                'platform': 'gitlab',
+                'project_id': mr['project_id'],
+                'iid': mr['iid'],
+                'title': mr['title'],
+                'web_url': mr['web_url']
+            })
     except requests.exceptions.RequestException as e:
         print(f"⚠️  GitLab error: {e}")
     
