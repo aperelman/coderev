@@ -8,6 +8,7 @@ import sys
 import time
 import subprocess
 import os
+import argparse
 from urllib.parse import quote
 
 # Default Ollama URL
@@ -52,6 +53,22 @@ AVAILABLE_MODELS = {
         'timeout': 120
     }
 }
+
+def parse_arguments():
+    """Parse command line arguments for platform selection"""
+    parser = argparse.ArgumentParser(description="Review GitHub PRs and GitLab MRs where sergio is reviewer", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Examples:
+  %(prog)s                 # Review both GitHub and GitLab (default)
+  %(prog)s --gh-only      # Review only GitHub PRs
+  %(prog)s --glab-only    # Review only GitLab MRs
+        """)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--gh-only', action='store_true', help='Review GitHub PRs only')
+    group.add_argument('--glab-only', action='store_true', help='Review GitLab MRs only')
+    args = parser.parse_args()
+    review_github = not args.glab_only
+    review_gitlab = not args.gh_only
+    return review_github, review_gitlab
 
 def load_config():
     """Load configuration from config.yml."""
@@ -575,6 +592,8 @@ def review_github_pr(pr, config, model_name, mode, timeout):
 
 def main():
     """Main: Find and review all PRs/MRs where sergio is reviewer"""
+    review_github, review_gitlab = parse_arguments()
+    
     # Check Ollama
     if not check_ollama_health():
         print("Cannot start Ollama. Exiting.")
@@ -596,11 +615,13 @@ def main():
     print("🔍 Finding PRs/MRs where sergio is reviewer...")
     print("="*60)
     
-    github_prs = get_github_prs_with_sergio(config)
-    gitlab_mrs = get_gitlab_mrs_with_sergio(config)
+    github_prs = get_github_prs_with_sergio(config) if review_github else []
+    gitlab_mrs = get_gitlab_mrs_with_sergio(config) if review_gitlab else []
     
-    print(f"🐙 GitHub: {len(github_prs)} PR(s) found")
-    print(f"🦊 GitLab: {len(gitlab_mrs)} MR(s) found")
+    if review_github:
+        print(f"🐙 GitHub: {len(github_prs)} PR(s) found")
+    if review_gitlab:
+        print(f"🦊 GitLab: {len(gitlab_mrs)} MR(s) found")
     
     all_items = github_prs + gitlab_mrs
     
