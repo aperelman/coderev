@@ -1,0 +1,19 @@
+# Sergio Bot Configuration Template
+# Copy this to config.yml and fill in your actual tokens
+
+github:
+  token: ghp_your_github_personal_access_token_here
+  username: your_github_username
+  repo: your_repo_name
+
+gitlab:
+  token: glpat_your_gitlab_personal_access_token_here
+  url: https://gitlab.com
+  username: your_gitlab_username
+
+ollama:
+  model: codellama:7b
+  base_url: http://localhost:11434
+
+review:
+  mode: json  # or 'text'
