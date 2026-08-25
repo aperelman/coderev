@@ -1,19 +1,22 @@
 # Sergio Bot Configuration Template
 # Copy this to config.yml and fill in your actual tokens
 
+# GitHub: Uses sergio's token for API access
 github:
-  token: ghp_your_github_personal_access_token_here
-  username: your_github_username
-  repo: your_repo_name
+  token: sergio_github_personal_access_token_here
+  reviewer: sergiorev  # GitHub username of reviewer to find
 
+# GitLab: Uses sergio's token for API access
 gitlab:
-  token: glpat_your_gitlab_personal_access_token_here
+  token: glpat_sergio_personal_access_token_here
   url: https://gitlab.com
-  username: your_gitlab_username
+  reviewer: sergioram  # GitLab username of reviewer to find
 
+# Ollama settings
 ollama:
   model: codellama:7b
   base_url: http://localhost:11434
 
+# Review output format
 review:
   mode: json  # or 'text'
