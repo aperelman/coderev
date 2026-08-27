@@ -313,6 +313,42 @@ def chunk_diff(diff, max_chunk_size=15000):
 # OLLAMA REVIEW FUNCTIONS
 # ============================================
 
+def build_review_prompt(diff, repo, pr_number, title, platform='github', chunk_idx=None, total_chunks=None):
+    """Build review prompt with cleaner, more readable format"""
+    part_info = f"(Part {chunk_idx} of {total_chunks}) " if chunk_idx else ""
+    
+    return f"""You are an expert code reviewer. Please review this code diff and provide constructive feedback.
+
+Repository: {repo}
+Platform: {platform}
+PR Number: #{pr_number}
+Title: {title}
+{part_info}
+
+Diff:
+{diff}
+
+Please provide your review in the following format:
+
+## Summary
+[Brief summary of the changes]
+
+## Issues Found
+[List any issues, bugs, or potential problems]
+
+## Suggestions
+[Suggestions for improvement]
+
+## Code Quality
+[Comments on code quality, style, and best practices]
+
+## Security Concerns
+[Any security issues to address]
+
+## Performance Impact
+[Any performance implications]
+"""
+
 def review_with_ollama(diff, repo, pr_number, title, model, timeout, platform='github'):
     """Send diff to Ollama for review"""
     if not diff:
@@ -335,38 +371,11 @@ def review_with_ollama(diff, repo, pr_number, title, model, timeout, platform='g
         if len(chunks) > 1:
             print(f"   📝 Processing chunk {chunk_idx + 1}/{len(chunks)}...")
         
-        prompt = f"""
-You are an expert code reviewer. Please review this code diff and provide constructive feedback.
-
-Repository: {repo}
-Platform: {platform}
-PR Number: #{pr_number}
-Title: {title}
-{"(Part " + str(chunk_idx + 1) + " of " + str(len(chunks)) + ")" if len(chunks) > 1 else ""}
-
-Diff:
-{chunk}
-
-Please provide your review in the following format:
-
-## Summary
-[Brief summary of the changes]
-
-## Issues Found
-[List any issues, bugs, or potential problems]
-
-## Suggestions
-[Suggestions for improvement]
-
-## Code Quality
-[Comments on code quality, style, and best practices]
-
-## Security Concerns
-[Any security issues to address]
-
-## Performance Impact
-[Any performance implications]
-"""
+        prompt = build_review_prompt(
+            chunk, repo, pr_number, title, platform,
+            chunk_idx + 1 if len(chunks) > 1 else None,
+            len(chunks) if len(chunks) > 1 else None
+        )
         
         print(f"   🤖 Sending to Ollama ({model})...")
         
