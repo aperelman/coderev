@@ -398,11 +398,21 @@ def review_with_ollama(diff, repo, pr_number, title, model, timeout, platform='g
                 print(f"   ❌ Ollama API error: {response.status_code}")
                 return None
         except requests.exceptions.Timeout:
-            print(f"   ❌ Ollama request timed out ({timeout}s)")
-            print(f"      Try a faster model from the selection menu")
+            print(f"   ⏱️  Request timed out ({timeout}s)")
+            print(f"      Tip: Try a faster model (neural-chat:7b or stable-code:3b)")
+            return None
+        except requests.exceptions.ConnectionError:
+            print(f"   ❌ Cannot connect to Ollama (http://127.0.0.1:11434)")
+            print(f"      Check: docker ps | grep ollama")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"   ❌ Network error: {type(e).__name__}")
+            return None
+        except ValueError as e:
+            print(f"   ❌ Invalid response from Ollama: {e}")
             return None
         except Exception as e:
-            print(f"   ❌ Ollama error: {e}")
+            print(f"   ❌ Unexpected error: {type(e).__name__}: {str(e)[:80]}")
             return None
     
     if all_reviews:
