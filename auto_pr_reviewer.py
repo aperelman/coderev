@@ -742,6 +742,24 @@ def process_gitlab_mrs(model, timeout):
 # ============================================
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Sergio Bot - Multi-Platform Code Review Automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  ./auto_pr_reviewer.py                 # Both platforms\n  ./auto_pr_reviewer.py --github-only    # GitHub only\n  ./auto_pr_reviewer.py --gitlab-only    # GitLab only"
+    )
+    parser.add_argument("--github-only", action="store_true", help="Review GitHub PRs only")
+    parser.add_argument("--gitlab-only", action="store_true", help="Review GitLab MRs only")
+    
+    args = parser.parse_args()
+    
+    if args.github_only and args.gitlab_only:
+        parser.error("Cannot use both --github-only and --gitlab-only")
+    
+    review_github = not args.gitlab_only
+    review_gitlab = not args.github_only
+    
     print("=" * 70)
     print("🤖 Sergio Bot - Multi-Platform Code Review Automation")
     print("=" * 70)
@@ -750,10 +768,10 @@ def main():
     model, timeout = select_model_interactive()
     
     # Process GitHub PRs
-    github_prs = process_github_prs(model, timeout)
+    github_prs = process_github_prs(model, timeout) if review_github else []
     
     # Process GitLab MRs
-    gitlab_mrs = process_gitlab_mrs(model, timeout)
+    gitlab_mrs = process_gitlab_mrs(model, timeout) if review_gitlab else []
     
     # Summary
     print("\n" + "=" * 70)
