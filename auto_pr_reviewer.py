@@ -602,13 +602,15 @@ def process_github_prs(model, timeout):
 # GITLAB FUNCTIONS
 # ============================================
 
-def get_gitlab_mrs_where_reviewer(project_id, reviewer_username, gitlab_token):
+def get_gitlab_mrs_where_reviewer(reviewer_username, gitlab_token):
     """Get open GitLab MRs where the bot is a reviewer"""
     mrs = []
     
-    url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests"
+    url = "https://gitlab.com/api/v4/merge_requests"
     params = {
         'state': 'opened',
+        'reviewer_username': reviewer_username,
+        'scope': 'all',
         'per_page': 100,
         'view': 'simple'
     }
@@ -618,12 +620,7 @@ def get_gitlab_mrs_where_reviewer(project_id, reviewer_username, gitlab_token):
         response = requests.get(url, headers=headers, params=params)
         if response.status_code == 200:
             all_mrs = response.json()
-            for mr in all_mrs:
-                reviewers = mr.get('reviewers', [])
-                for reviewer in reviewers:
-                    if reviewer.get('owner') == reviewer_username:
-                        mrs.append(mr)
-                        break
+            mrs = all_mrs  # API already filters by reviewer_username
     except Exception as e:
         print(f"   ⚠️  GitLab error: {e}")
     
@@ -678,20 +675,15 @@ def process_gitlab_mrs(model, timeout):
     reviewer = gitlab_config.get('reviewer', 'sergioram')
     token = gitlab_config.get('owner_token')
     
-    if not project_id:
-        print("⚠️  No GitLab project_id configured")
-        return []
-    
     if not token:
         print("⚠️  No GitLab token configured")
         return []
     
     print(f"👤 Bot user: {reviewer}")
-    print(f"📂 Project ID: {project_id}")
     print("")
     
-    print(f"🔍 Checking GitLab project {project_id} for MRs assigned to {reviewer}...")
-    mrs = get_gitlab_mrs_where_reviewer(project_id, reviewer, token)
+    print(f"🔍 Searching all GitLab projects for MRs assigned to {reviewer}...")
+    mrs = get_gitlab_mrs_where_reviewer(reviewer, token)
     
     if mrs:
         print(f"   ✅ Found {len(mrs)} MR(s)")
@@ -707,6 +699,7 @@ def process_gitlab_mrs(model, timeout):
         
         for mr in mrs:
             mr_iid = mr['iid']
+            project_id = mr.get('project_id')
             title = mr['title']
             
             print(f"\n📝 Reviewing MR !{mr_iid}: {title}")
