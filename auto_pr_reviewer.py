@@ -743,14 +743,12 @@ def process_gitlab_mrs(model, timeout):
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(
-        description="Sergio Bot - Multi-Platform Code Review Automation",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  ./auto_pr_reviewer.py                 # Both platforms\n  ./auto_pr_reviewer.py --github-only    # GitHub only\n  ./auto_pr_reviewer.py --gitlab-only    # GitLab only"
-    )
-    parser.add_argument("--github-only", action="store_true", help="Review GitHub PRs only")
-    parser.add_argument("--gitlab-only", action="store_true", help="Review GitLab MRs only")
-    
+    parser = argparse.ArgumentParser(description="Automated multi-platform PR reviewer powered by Ollama.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--github-only", "--gh-only", action="store_true", help="Review GitHub pull requests only")
+    group.add_argument("--gitlab-only", "--glab-only", action="store_true", help="Review GitLab merge requests only")
+    parser.add_argument("--model", type=str, help="Specify Ollama model to use")
+    parser.add_argument("--timeout", type=int, default=300, help="Request timeout in seconds")
     args = parser.parse_args()
     
     if args.github_only and args.gitlab_only:
