@@ -533,7 +533,7 @@ def process_github_prs(model, timeout):
         print("⚠️  Could not setup GitHub SSH")
         return []
     
-    username = github_config.get('owner', 'aperelman')
+    username = github_config.get('owner', 'NimbusHelmAI')
     reviewer = github_config.get('reviewer', 'sergiorev')
     
     print(f"👤 Bot user: {reviewer}")
@@ -641,8 +641,14 @@ def get_gitlab_mr_diff(project_id, mr_iid, gitlab_token):
                 diff_text += diff.get('diff', '')
                 diff_text += "\n"
             return diff_text
-    except Exception:
-        pass
+    except requests.exceptions.Timeout:
+        print(f"   ⚠️  GitLab API timeout - response took too long")
+    except requests.exceptions.ConnectionError:
+        print(f"   ⚠️  GitLab connection error - check network")
+    except requests.exceptions.HTTPError as e:
+        print(f"   ⚠️  GitLab API error: {e.response.status_code}")
+    except Exception as e:
+        print(f"   ⚠️  Unexpected error fetching GitLab diff: {e}")
     
     return None
 
