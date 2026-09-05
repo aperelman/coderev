@@ -48,11 +48,26 @@ AVAILABLE_MODELS = {
 }
 
 def load_config():
+    """Load configuration from config.yml with proper error handling"""
     try:
         with open('config.yml', 'r') as f:
-            return yaml.safe_load(f)
-    except:
-        return {}
+            config = yaml.safe_load(f)
+            if not config:
+                print("⚠️  config.yml is empty - using defaults")
+                return {}
+            return config
+    except FileNotFoundError:
+        print("❌ config.yml not found!")
+        print("   Please copy config.example.yml to config.yml and configure it")
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        print(f"❌ Invalid YAML in config.yml: {e}")
+        print("   Check your YAML syntax at https://www.yamllint.com/")
+        sys.exit(1)
+    except PermissionError:
+        print("❌ Permission denied reading config.yml")
+        print("   Check file permissions: chmod 644 config.yml")
+        sys.exit(1)
 
 # ─── DOCKER OLLAMA FUNCTIONS ──────────────────────────────────────────────────
 
@@ -62,10 +77,18 @@ def check_ollama_container_running():
         result = subprocess.run(
             ['docker', 'ps', '--filter', 'name=ollama', '--format', '{{.Status}}'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=5
         )
         return result.returncode == 0 and 'Up' in result.stdout
-    except:
+    except FileNotFoundError:
+        # Docker is not installed
+        return False
+    except subprocess.TimeoutExpired:
+        # Docker command took too long
+        return False
+    except Exception as e:
+        # Unexpected error (should rarely happen)
         return False
 
 def check_ollama_api_ready():
@@ -73,7 +96,14 @@ def check_ollama_api_ready():
     try:
         response = requests.get('http://127.0.0.1:11434/api/tags', timeout=2)
         return response.status_code == 200
-    except:
+    except requests.exceptions.ConnectionError:
+        # Ollama API not responding
+        return False
+    except requests.exceptions.Timeout:
+        # Request timed out
+        return False
+    except requests.exceptions.RequestException:
+        # Other request errors
         return False
 
 def start_ollama_via_node():
@@ -85,7 +115,9 @@ def start_ollama_via_node():
         os.path.join(os.path.dirname(__file__), 'ollama-start.js'),
         './ollama-start.js',
         os.path.expanduser('~/src/coderev/ollama-start.js'),
-        '/home/amitp/src/coderev/ollama-start.js'
+        os.path.expanduser('~/coderev/ollama-start.js'),
+        # Use PROJECT_DIR env var if set (for CI/CD environments)
+        os.path.join(os.environ.get('PROJECT_DIR', '.'), 'ollama-start.js')
     ]
     
     script_path = None
@@ -122,9 +154,10 @@ def start_ollama_via_node():
         print("   Check: docker logs ollama")
         return False
         
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"Error: Ollama failed to start: {e}")
+    except subprocess.TimeoutExpired as e:
+        print(f"❌ Ollama startup timed out: {e}")
         return False
+    except OSError as e:
         print(f"❌ Failed to start Ollama via Node: {e}")
         return False
 
@@ -172,7 +205,8 @@ def get_installed_models():
         result = subprocess.run(
             ['docker', 'exec', 'ollama', 'ollama', 'list'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=10
         )
         if result.returncode == 0:
             # Parse the output (skip header line)
@@ -184,8 +218,14 @@ def get_installed_models():
                     if parts:
                         models.append(parts[0])
             return models
-    except:
-        pass
+    except subprocess.TimeoutExpired:
+        print("   ⚠️  Docker command timed out while listing models")
+    except FileNotFoundError:
+        print("   ⚠️  Docker not found or not in PATH")
+    except subprocess.CalledProcessError as e:
+        print(f"   ⚠️  Docker error: {e}")
+    except Exception as e:
+        print(f"   ⚠️  Unexpected error listing models: {e}")
     return []
 
 def select_model_interactive():
@@ -591,7 +631,9 @@ def process_github_prs(model, timeout):
                 
                 review = review_with_ollama(diff, repo, pr_number, title, model, timeout, 'github')
                 
-                if review:
+                if review is None:
+                    print(f"   ⚠️  Skipping PR #{pr_number} - review generation failed (Ollama issue?)")
+                elif review:
                     print(f"\n   📋 Review summary:")
                     summary_lines = review.split('\n')[:5]
                     for line in summary_lines:
@@ -599,11 +641,13 @@ def process_github_prs(model, timeout):
                             print(f"      {line}")
                     print(f"      ... (full review in PR comment)")
                     
-                    post_github_review_comment(repo, pr_number, review)
+                    success = post_github_review_comment(repo, pr_number, review)
+                    if not success:
+                        print(f"   ⚠️  Review generated but failed to post to GitHub")
                 else:
-                    print(f"   ⚠️  No review generated")
+                    print(f"   ⚠️  Review generated but is empty")
             else:
-                print(f"   ❌ Failed to fetch diff")
+                print(f"   ❌ Failed to fetch diff - skipping PR #{pr_number}")
     
     print(f"\n📊 GitHub total: {len(all_prs)} PR(s) found")
     return all_prs
@@ -613,28 +657,64 @@ def process_github_prs(model, timeout):
 # ============================================
 
 def get_gitlab_mrs_where_reviewer(reviewer_username, gitlab_token):
-    """Get open GitLab MRs where the bot is a reviewer"""
+    """Get open GitLab MRs where the bot is a reviewer across ALL projects"""
     mrs = []
-    
-    url = "https://gitlab.com/api/v4/merge_requests"
-    params = {
-        'state': 'opened',
-        'reviewer_username': reviewer_username,
-        'scope': 'all',
-        'per_page': 100,
-        'view': 'simple'
-    }
     headers = {'PRIVATE-TOKEN': gitlab_token}
     
     try:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            all_mrs = response.json()
-            mrs = all_mrs  # API already filters by reviewer_username
+        # Step 1: Get all projects accessible to this token
+        print(f"   📚 Fetching all accessible projects...")
+        projects_url = "https://gitlab.com/api/v4/projects"
+        projects_params = {
+            'membership': 'true',  # Only projects user is member of
+            'per_page': 100,
+            'order_by': 'name'
+        }
+        
+        projects_response = requests.get(projects_url, headers=headers, params=projects_params, timeout=10)
+        if projects_response.status_code != 200:
+            print(f"   ❌ Failed to fetch projects: HTTP {projects_response.status_code}")
+            return mrs
+        
+        projects = projects_response.json()
+        print(f"   📊 Found {len(projects)} projects, checking for open MRs...")
+        
+        # Step 2: For each project, fetch open MRs and filter by reviewer
+        for project in projects:
+            project_id = project['id']
+            project_name = project['name']
+            
+            try:
+                mrs_url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests"
+                mrs_params = {
+                    'state': 'opened',
+                    'per_page': 100
+                }
+                
+                mrs_response = requests.get(mrs_url, headers=headers, params=mrs_params, timeout=10)
+                if mrs_response.status_code == 200:
+                    project_mrs = mrs_response.json()
+                    
+                    # Filter by reviewer
+                    for mr in project_mrs:
+                        reviewers = mr.get('reviewers', [])
+                        for reviewer in reviewers:
+                            if reviewer.get('username') == reviewer_username:
+                                mrs.append(mr)
+                                print(f"      ✓ !{mr['iid']}: {mr['title'][:60]}... (project: {project_name})")
+                                break
+                                
+            except requests.exceptions.Timeout:
+                print(f"   ⚠️  Timeout fetching MRs from project {project_name}")
+            except Exception as e:
+                print(f"   ⚠️  Error fetching MRs from project {project_name}: {e}")
+                
+    except requests.exceptions.Timeout:
+        print(f"   ⚠️  GitLab API timeout - response took too long")
+    except requests.exceptions.ConnectionError:
+        print(f"   ⚠️  GitLab connection error - check network/VPN")
     except requests.exceptions.RequestException as e:
-        print(f"GitLab error: {e}")
-    
-        print(f"   ⚠️  GitLab error: {e}")
+        print(f"   ❌ GitLab request failed: {e}")
     
     return mrs
 
@@ -671,16 +751,28 @@ def post_gitlab_review_comment(project_id, mr_iid, review_text, gitlab_token):
     data = {'body': review_text}
     
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers=headers, json=data, timeout=10)
         if response.status_code == 201:
             print(f"   ✅ Review comment posted to !{mr_iid}")
             return True
+        elif response.status_code == 401:
+            print(f"   ❌ GitLab authentication failed - check token")
+            return False
+        elif response.status_code == 404:
+            print(f"   ⚠️  GitLab MR not found (!{mr_iid})")
+            return False
+        else:
+            print(f"   ❌ Failed to post comment: HTTP {response.status_code}")
+            return False
+    except requests.exceptions.Timeout:
+        print(f"   ⚠️  GitLab API timeout while posting comment")
+        return False
+    except requests.exceptions.ConnectionError:
+        print(f"   ⚠️  GitLab connection error while posting comment")
+        return False
     except requests.exceptions.RequestException as e:
-        print(f"Error posting comment: {e}")
-    
-        print(f"   ⚠️  Error posting comment: {e}")
-    
-    return False
+        print(f"   ❌ Failed to post comment: {e}")
+        return False
 
 def process_gitlab_mrs(model, timeout):
     """Main function to process GitLab MRs"""
@@ -691,12 +783,11 @@ def process_gitlab_mrs(model, timeout):
     config = load_config()
     gitlab_config = config.get('gitlab', {})
     
-    project_id = gitlab_config.get('project_id')
     reviewer = gitlab_config.get('reviewer', 'sergioram')
-    token = gitlab_config.get('owner_token')
+    token = gitlab_config.get('reviewer_token')
     
     if not token:
-        print("⚠️  No GitLab token configured")
+        print("⚠️  No GitLab reviewer_token configured")
         return []
     
     print(f"👤 Bot user: {reviewer}")
@@ -733,7 +824,9 @@ def process_gitlab_mrs(model, timeout):
                 
                 review = review_with_ollama(diff, f"project_{project_id}", mr_iid, title, model, timeout, 'gitlab')
                 
-                if review:
+                if review is None:
+                    print(f"   ⚠️  Skipping MR !{mr_iid} - review generation failed (Ollama issue?)")
+                elif review:
                     print(f"\n   📋 Review summary:")
                     summary_lines = review.split('\n')[:5]
                     for line in summary_lines:
@@ -741,11 +834,13 @@ def process_gitlab_mrs(model, timeout):
                             print(f"      {line}")
                     print(f"      ... (full review in MR comment)")
                     
-                    post_gitlab_review_comment(project_id, mr_iid, review, token)
+                    success = post_gitlab_review_comment(project_id, mr_iid, review, token)
+                    if not success:
+                        print(f"   ⚠️  Review generated but failed to post to GitLab")
                 else:
-                    print(f"   ⚠️  No review generated")
+                    print(f"   ⚠️  Review generated but is empty")
             else:
-                print(f"   ❌ Failed to fetch diff")
+                print(f"   ❌ Failed to fetch diff - skipping MR !{mr_iid}")
     
     print(f"\n📊 GitLab total: {len(mrs)} MR(s) found")
     return mrs
