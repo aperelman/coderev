@@ -1,0 +1,24 @@
+# Auto PR Reviewer Configuration
+
+# GitHub Configuration
+github:
+  auth_method: "ssh"                    # SSH authentication for GitHub
+  ssh_user: "sergiorev"                 # GitHub bot username for reviews
+  owner: "NimbusHelmAI"                 # GitHub organization/owner
+  reviewer_username: "sergiorev"        # Filter: only review PRs assigned to this user
+
+# GitLab Configuration
+# Reviews all MRs where 'reviewer' is assigned as a reviewer across all accessible projects
+gitlab:
+  reviewer: "sergioram"                 # GitLab bot username to filter MRs by reviewer
+  reviewer_token: "glpat-xxxxx"         # GitLab personal access token with scopes:
+                                        #   - api (for posting comments)
+                                        #   - read_api (for reading MR list)
+                                        #   - read_repository (for reading diffs)
+                                        # Get token at: https://gitlab.com/-/user_settings/personal_access_tokens
+
+# Ollama Configuration (optional)
+# Comment out or leave default if using local Ollama
+ollama:
+  url: "http://127.0.0.1:11434"        # Ollama API endpoint
+  default_model: "qwen2.5-coder:7b"    # Default model for code review
