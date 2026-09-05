@@ -122,7 +122,9 @@ def start_ollama_via_node():
         print("   Check: docker logs ollama")
         return False
         
-    except Exception as e:
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"Error: Ollama failed to start: {e}")
+        return False
         print(f"❌ Failed to start Ollama via Node: {e}")
         return False
 
@@ -448,7 +450,9 @@ def get_github_repos_for_user(username):
             repos = [f"{repo['owner']['login']}/{repo['name']}" for repo in repo_list]
             print(f"📂 Found {len(repos)} GitHub repos under {username}")
             return repos
-    except Exception as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"Error listing GitHub repos: {e}")
+    
         print(f"⚠️  Error listing GitHub repos: {e}")
     
     return repos
@@ -473,7 +477,9 @@ def get_github_prs_where_reviewer(repo, reviewer_username):
                     if req.get('login') == reviewer_username:
                         prs.append(pr)
                         break
-    except Exception as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"Error: {str(e)[:100]}")
+    
         print(f"   ⚠️  Error: {str(e)[:100]}")
     
     return prs
@@ -489,7 +495,9 @@ def get_github_pr_diff(repo, pr_number):
         )
         if result.returncode == 0:
             return result.stdout
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {str(e)[:100]}")
+    
         print(f"   ⚠️  Error: {str(e)[:100]}")
     
     return None
@@ -516,7 +524,9 @@ def post_github_review_comment(repo, pr_number, review_text):
         else:
             print(f"   ⚠️  Failed to post comment: {result.stderr[:100]}")
             return False
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
+        print(f"Error posting comment: {e}")
+        return False
         print(f"   ⚠️  Error posting comment: {e}")
         return False
 
@@ -621,7 +631,9 @@ def get_gitlab_mrs_where_reviewer(reviewer_username, gitlab_token):
         if response.status_code == 200:
             all_mrs = response.json()
             mrs = all_mrs  # API already filters by reviewer_username
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        print(f"GitLab error: {e}")
+    
         print(f"   ⚠️  GitLab error: {e}")
     
     return mrs
@@ -663,7 +675,9 @@ def post_gitlab_review_comment(project_id, mr_iid, review_text, gitlab_token):
         if response.status_code == 201:
             print(f"   ✅ Review comment posted to !{mr_iid}")
             return True
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        print(f"Error posting comment: {e}")
+    
         print(f"   ⚠️  Error posting comment: {e}")
     
     return False
